@@ -19,7 +19,7 @@ name: Weekly event fetch
 on:
   schedule:
     - cron: '0 9 * * MON'  # 9am UTC every Monday
-    - cron: '0 14 * * FRI' # 2pm UTC Friday = 7am in SF (6am in winter)
+    - cron: '0 14 * * THU' # 2pm UTC Thursday = 7am in SF (6am in winter)
   workflow_dispatch:
     inputs:
       provider:
