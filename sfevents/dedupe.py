@@ -101,6 +101,9 @@ def _merge(group: list[dict]) -> dict:
         # A date-only card borrows the time from a copy that has one.
         if not _has_time(keep) and _has_time(other):
             keep["start_ts"] = other["start_ts"]
+    # Only new if no source had listed it before this fetch.
+    if "is_new" in keep:
+        keep["is_new"] = all(r.get("is_new") for r in group)
     # Keys of the copies folded in, so a plan pinned to one still finds it.
     also = [o["key"] for o in group[1:] if o.get("key")]
     if also:

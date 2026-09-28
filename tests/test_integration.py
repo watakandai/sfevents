@@ -492,3 +492,34 @@ def test_export_gives_each_event_a_stable_key(tmp_path):
 
     [event] = json.loads(out_path.read_text())
     assert event["key"] == "funcheap_sf:abc"
+
+
+def test_export_flags_events_new_in_the_latest_fetch(tmp_path):
+    """Only events first seen by the latest fetch are "new"; meta.json names the model."""
+    import json
+    from datetime import date, datetime, timedelta
+
+    from sfevents.db import connect, set_scores
+    from sfevents.models import Event
+
+    db_path = tmp_path / "events.db"
+    out_path = tmp_path / "events.json"
+    init_db(db_path)
+    day = datetime.combine(date.today() + timedelta(days=5), datetime.min.time())
+    upsert_events(db_path, [Event("funcheap_sf", "old", "Old Fair", day, day)])
+    # Pretend that one was first seen last week; re-fetching mustn't reset it.
+    with connect(db_path) as conn:
+        conn.execute("UPDATE events SET first_seen = '2020-01-01T00:00:00+00:00'")
+    upsert_events(db_path, [Event("funcheap_sf", "old", "Old Fair", day, day),
+                            Event("funcheap_sf", "new", "New Fair", day, day)])
+    ids = {r["source_id"]: r["id"] for r in query_events(db_path)}
+    set_scores(db_path, {ids["new"]: (80, "good")}, "ollama:qwen3.5:4b", "h")
+
+    run_cli(["--db", str(db_path), "export", "--out", str(out_path)])
+
+    events = {e["title"]: e for e in json.loads(out_path.read_text())}
+    assert events["New Fair"]["is_new"] and not events["Old Fair"]["is_new"]
+    meta = json.loads((tmp_path / "meta.json").read_text())
+    assert meta["ranked_by"] == ["ollama:qwen3.5:4b"]
+    assert meta["new_count"] == 1
+    assert meta["updated_at"]

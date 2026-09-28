@@ -78,6 +78,7 @@
   .badge.score { background: #efe7ff; color: #5b21b6; font-variant-numeric: tabular-nums; }
   .badge.approx { background: #fff4e5; color: #92400e; }
   .badge.annual { background: #fff8e1; color: #8a6d00; }
+  .badge.new { background: #d7263d; color: #fff; font-weight: 600; letter-spacing: .03em; }
   .event-why { font-size: 12px; color: var(--muted); margin-top: 4px; font-style: italic; }
   .toolbar select { padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; background: var(--card); color: var(--text); }
   .rank-note { font-size: 12px; color: var(--muted); margin-bottom: 10px; }
@@ -321,6 +322,10 @@ async function loadEvents() {
       ? `${allEvents.length} events loaded.`
       : 'No events found in the latest export.';
     document.getElementById('status').textContent = generatedNote;
+    // Optional: an older export has no meta.json, and the page works without it.
+    const meta = await fetch('data/meta.json', { cache: 'no-cache' })
+      .then(r => r.ok ? r.json() : null).catch(() => null);
+    if (meta) document.getElementById('status').textContent = `${generatedNote} ${updatedNote(meta)}`;
   } catch (e) {
     document.getElementById('status').textContent =
       'Could not load event data (data/events.json missing or invalid). Has the weekly export run yet?';
@@ -328,6 +333,24 @@ async function loadEvents() {
   }
   // First load opens on today; a reload after an edit stays where you were.
   if (calYear == null) goToday(); else render();
+}
+
+// "Updated today · ranked by ollama:qwen3.5:4b · 12 new"
+function updatedNote(meta) {
+  const parts = [];
+  const at = meta.updated_at ? new Date(meta.updated_at) : null;
+  if (at && !isNaN(at)) {
+    const days = Math.floor((startOfDay(new Date()) - startOfDay(at)) / 864e5);
+    const ago = days <= 0 ? 'today' : days === 1 ? 'yesterday' : `${days}d ago`;
+    parts.push(`Updated ${ago} (${at.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })})`);
+  }
+  if (meta.ranked_by && meta.ranked_by.length) parts.push(`ranked by ${meta.ranked_by.join(', ')}`);
+  if (meta.new_count) parts.push(`${meta.new_count} new`);
+  return parts.join(' \u00b7 ');
+}
+
+function startOfDay(d) {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
 }
 
 function baseFiltered() {
@@ -1015,6 +1038,7 @@ function cardHtml(e) {
     ? '<span class="badge approx" title="Follows a typical-year rule, not an announced date - confirm before making plans">date approx</span>'
     : '';
   const annualBadge = e.source === 'annual_bay_area' ? '<span class="badge annual">Annual</span>' : '';
+  const newBadge = e.is_new ? '<span class="badge new" title="Added in the latest refresh">New</span>' : '';
   const why = e.score_reason ? `<div class="event-why">${escapeHtml(e.score_reason)}</div>` : '';
 
   const sourceLink = e.url ? `<div class="event-source"><a href="${escapeHtml(e.url)}" target="_blank" rel="noopener noreferrer">View source \u2197</a></div>` : '';
@@ -1025,7 +1049,7 @@ function cardHtml(e) {
       ${repeatsHtml(e)}
       <div class="event-title">${escapeHtml(e.title)}</div>
       ${locationHtml(e)}
-      <div>${planBadgeHtml(e)}${scoreBadge}${annualBadge}${approxBadge}${dothebayBadge}${freeBadge}${badges}</div>
+      <div>${newBadge}${planBadgeHtml(e)}${scoreBadge}${annualBadge}${approxBadge}${dothebayBadge}${freeBadge}${badges}</div>
       ${why}
       ${sourceLink}
       ${planActionsHtml(e)}

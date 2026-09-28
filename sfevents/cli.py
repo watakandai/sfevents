@@ -2,7 +2,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from . import geocode as geocoding
@@ -201,6 +201,7 @@ EXPORT_FIELDS = (
     "cost", "is_free", "categories", "url", "description", "images",
     "lat", "lon", "score", "score_reason", "scored_by", "date_approx", "key",
     "also",
+    "is_new",
 )
 DESCRIPTION_LIMIT = 280
 
@@ -213,9 +214,36 @@ def _slim(event: dict) -> dict:
     return out
 
 
+def _export_meta(events: list[dict]) -> dict:
+    """When the data was refreshed and which model(s) did the latest ranking.
+
+    "Latest" is the most recent day any LLM scored anything: a run that only
+    had cached scores to reuse still credits the model that wrote them.
+    """
+    llm = [e for e in events if e.get("scored_at") and e.get("scored_by") not in (None, "heuristic")]
+    models: list[str] = []
+    if llm:
+        last_day = max(e["scored_at"][:10] for e in llm)
+        counts: dict[str, int] = {}
+        for e in llm:
+            if e["scored_at"][:10] == last_day:
+                counts[e["scored_by"]] = counts.get(e["scored_by"], 0) + 1
+        models = sorted(counts, key=counts.get, reverse=True)
+    return {
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "ranked_by": models,
+        "new_count": sum(1 for e in events if e["is_new"]),
+    }
+
+
 def _cmd_export(args) -> None:
     today = date.today().isoformat()
     events = [_keyed(row_to_dict(row)) for row in query_events(args.db, order_by=args.sort)]
+    # "New" means first seen by the most recent fetch run - compared by day,
+    # since each fetcher stamps its own time within the run.
+    last_fetch = max((e["fetched_at"][:10] for e in events if e.get("fetched_at")), default="")
+    for e in events:
+        e["is_new"] = bool(last_fetch) and (e.get("first_seen") or "")[:10] == last_fetch
     total = len(events)
     if not args.include_past:
         # Undated events are kept: "date TBD" is upcoming until proven otherwise.
@@ -230,6 +258,7 @@ def _cmd_export(args) -> None:
     merged = len(events)
     events = dedupe(events)
     merged -= len(events)
+    meta = _export_meta(events)
     if not args.full:
         events = [_slim(e) for e in events]
 
@@ -242,6 +271,9 @@ def _cmd_export(args) -> None:
         "  " + json.dumps(e, separators=(",", ":"), default=str) for e in events
     )
     out_path.write_text(f"[\n{lines}\n]\n" if events else "[]\n")
+    # Beside events.json rather than inside it, so the events file stays a
+    # plain array and its diff isn't touched by a timestamp that always moves.
+    (out_path.parent / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
     dropped = total - len(events) - merged
     notes = []
     if dropped:

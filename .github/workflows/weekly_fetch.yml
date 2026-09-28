@@ -19,6 +19,7 @@ name: Weekly event fetch
 on:
   schedule:
     - cron: '0 9 * * MON'  # 9am UTC every Monday
+    - cron: '0 14 * * FRI' # 2pm UTC Friday = 7am in SF (6am in winter)
   workflow_dispatch:
     inputs:
       provider:
@@ -228,8 +229,8 @@ jobs:
       - name: Commit and push if the export changed
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: 'Weekly event data refresh'
-          file_pattern: docs/data/events.json
+          commit_message: 'Event data refresh'
+          file_pattern: docs/data/events.json docs/data/meta.json
 
       - name: Save events database
         if: always()

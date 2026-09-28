@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS events (
     url TEXT,
     description TEXT,
     fetched_at TEXT NOT NULL,
+    first_seen TEXT,
     notability INTEGER NOT NULL DEFAULT 0,
     date_approx INTEGER NOT NULL DEFAULT 0,
     images TEXT,
@@ -91,6 +92,7 @@ MIGRATIONS = {
     "scored_by": "TEXT",
     "scored_at": "TEXT",
     "profile_hash": "TEXT",
+    "first_seen": "TEXT",
 }
 
 
@@ -119,6 +121,9 @@ def init_db(db_path: str | Path) -> None:
         for column, decl in MIGRATIONS.items():
             if column not in existing:
                 conn.execute(f"ALTER TABLE events ADD COLUMN {column} {decl}")
+        # Rows from before first_seen existed: their last fetch is the best
+        # guess, and it predates the next fetch, so they don't all show as new.
+        conn.execute("UPDATE events SET first_seen = fetched_at WHERE first_seen IS NULL")
         conn.executescript(INDEXES)
 
 
@@ -129,9 +134,9 @@ def upsert_events(db_path: str | Path, events: list[Event]) -> int:
             conn.execute(
                 """INSERT INTO events
                    (source, source_id, title, start_ts, end_ts, venue, address,
-                    cost, categories, url, description, fetched_at,
+                    cost, categories, url, description, fetched_at, first_seen,
                     notability, date_approx, images)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(source, source_id) DO UPDATE SET
                      title=excluded.title, start_ts=excluded.start_ts, end_ts=excluded.end_ts,
                      venue=excluded.venue, address=excluded.address, cost=excluded.cost,
@@ -144,7 +149,7 @@ def upsert_events(db_path: str | Path, events: list[Event]) -> int:
                     e.start.isoformat() if e.start else None,
                     e.end.isoformat() if e.end else None,
                     e.venue, e.address, e.cost, ",".join(e.categories),
-                    e.url, e.description, now,
+                    e.url, e.description, now, now,
                     e.notability, int(e.date_approx),
                     json.dumps(e.images) if e.images else None,
                 ),
