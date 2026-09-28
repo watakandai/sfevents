@@ -4,11 +4,17 @@ Unlike every other source, this one publishes news articles, not listings:
 the date, time and venue live in prose ("returning this Friday, September
 25 ... from 5 to 10 pm on Irving Street"). So the fetch is two steps:
 
-1. Pull recent "Things To Do" posts from the site's public WordPress REST
-   API - clean JSON, no HTML scraping.
+1. Pull recent posts from the event-bearing categories of the site's
+   public WordPress REST API - clean JSON, no HTML scraping.
 2. Ask an LLM to turn each article into zero or more structured events.
    Groq goes first so this doesn't eat into the small Gemini quota the
    ranker depends on; see DEFAULT_PROVIDERS.
+
+Some of the best posts are evergreen round-ups - "things to do this
+weekend", "events this October" - first published years ago and rewritten
+every week or month under the same id. So posts are selected, and relative
+dates resolved, by when they were last modified rather than published, and
+a long round-up is split at its headings and extracted a chunk at a time.
 
 Extractions are cached in the database by (article id, last-modified), so
 an article costs one model call when it first appears and again only if the
@@ -38,16 +44,38 @@ from .tribe import collapse_repeats
 
 API_URL = "https://secretsanfrancisco.com/wp-json/wp/v2/posts"
 THINGS_TO_DO = 13  # English "Things To Do"; the Spanish copies are 740
+# Plenty of events are filed only under a topic: a Golden Gate Park concert
+# under Music, a museum opening under Culture. Top News (11) and Escapes
+# (240, day trips) are left out - mostly news and out-of-town travel, and
+# every article costs a model call. Non-events come back as [] anyway.
+CATEGORIES = (
+    THINGS_TO_DO,
+    2967,  # Music
+    3,     # Culture
+    4119,  # Cinema
+    6,     # Food & Drink
+    10,    # Wellness & Nature
+    2029,  # Sports
+    1613,  # Christmas
+)
 SPONSORED = 12
-LOOKBACK_DAYS = 21
+# By last-modified date, so a rewritten round-up counts as recent. Events are
+# often announced a month or more ahead. Only the first run pays for the
+# whole window; after that, cached articles cost nothing.
+LOOKBACK_DAYS = 45
+PER_PAGE = 100  # the WordPress API's maximum
+MAX_PAGES = 5
 # Groq first: its free tier allows ~1K requests a day, where Gemini's allows
 # ~20 and the ranker needs them. SECRETSF_PROVIDERS overrides.
 DEFAULT_PROVIDERS = ("groq", "gemini", "ollama")
 # Seconds between calls to one provider. An article prompt is up to ~1.6K
 # tokens plus the reply, and Groq's free tier caps tokens per minute at 8K.
 PACING = {"groq": 20.0, "gemini": 15.0}
+# Per model call. A longer article is split at its <h2> headings - one per
+# event in a round-up - so an event never straddles two chunks.
 MAX_ARTICLE_CHARS = 6000
-MAX_EVENTS_PER_ARTICLE = 10
+MAX_CHUNKS = 8
+MAX_EVENTS_PER_ARTICLE = 15  # per chunk
 
 # One per event, so the page's kind chips pick it up (docs/index.html KINDS).
 KINDS = (
@@ -58,8 +86,8 @@ KINDS = (
 
 PROMPT = """You turn a San Francisco news article into event listings.
 
-The article was published {published} (Pacific time). Resolve relative \
-dates like "this Friday" or "next weekend" against that date.
+The article was last updated {published} (Pacific time). Resolve relative \
+dates like "this Friday" or "next weekend" against that date.{part}
 
 Return ONLY a JSON object, no prose, no code fence:
 {{"events": [{{"title": "<the event's own name>", \
@@ -68,13 +96,18 @@ Return ONLY a JSON object, no prose, no code fence:
 "address": "<street and city, or empty>", \
 "cost": "<\\"0\\" if free, a price like \\"$25\\" or \\"$15-40\\", or empty if unstated>", \
 "kind": "<one of: {kinds}>", \
-"summary": "<one sentence on what it is>"}}]}}
+"summary": "<one sentence on what it is>", \
+"date_from_title": <true if the dates came from the article title, else false>}}]}}
 
 Rules:
 - Only things a person can attend in person on a specific date or date \
 range. A multi-week exhibit or pop-up is one entry with start and end.
 - One event on several separate dates: one entry per date, at most 6.
-- A round-up of many events: at most {max_events}, the most prominent.
+- A round-up of many events: every item that is an event, at most \
+{max_events}.
+- A round-up titled with dates ("this weekend: September 25-27", "this \
+October") covers those dates. An item in it that gives no date of its own \
+runs over the title's dates, with date_from_title true.
 - Not an event (news, a guide, a restaurant review, a contest or \
 giveaway, a list with no dates): {{"events": []}}.
 - Never guess. No stated time means a date-only start. No venue means "".
@@ -107,20 +140,28 @@ class SecretSFFetcher:
         self.db_path = db_path
 
     def fetch(self) -> list[Event]:
-        after = datetime.now(timezone.utc) - timedelta(days=self.lookback_days)
-        query = urllib.parse.urlencode({
-            "categories": THINGS_TO_DO,
-            "categories_exclude": SPONSORED,
-            "after": after.strftime("%Y-%m-%dT%H:%M:%S"),
-            "per_page": 50,
-            "_embed": "wp:featuredmedia",
-            "_fields": "id,date,modified,link,title,content,excerpt,_links,_embedded",
-        })
-        req = urllib.request.Request(
-            f"{self.api_url}?{query}", headers={"User-Agent": "sfevents/0.1"}
-        )
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            posts = json.loads(resp.read().decode())
+        since = datetime.now(timezone.utc) - timedelta(days=self.lookback_days)
+        posts: list[dict] = []
+        page, pages = 1, 1
+        while page <= min(pages, MAX_PAGES):
+            query = urllib.parse.urlencode({
+                "categories": ",".join(map(str, CATEGORIES)),
+                "categories_exclude": SPONSORED,
+                "modified_after": since.strftime("%Y-%m-%dT%H:%M:%S"),
+                "per_page": PER_PAGE,
+                "page": page,
+                "_embed": "wp:featuredmedia",
+                "_fields": "id,date,modified,link,title,content,excerpt,_links,_embedded",
+            })
+            req = urllib.request.Request(
+                f"{self.api_url}?{query}", headers={"User-Agent": "sfevents/0.1"}
+            )
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                posts += json.loads(resp.read().decode())
+                # Asking past the last page is a 400, so go by the count.
+                headers = getattr(resp, "headers", None) or {}
+                pages = int(headers.get("X-WP-TotalPages") or 1)
+            page += 1
         return self.parse(posts)
 
     def parse(self, posts: list[dict]) -> list[Event]:
@@ -147,10 +188,14 @@ class SecretSFFetcher:
                     failed += 1
                     continue
                 try:
-                    result, by = llm.complete(_prompt(post), parse=parse_reply)
+                    result = []
+                    for prompt in _prompts(post):
+                        items, by = llm.complete(prompt, parse=parse_reply)
+                        result += items
                 except NoProviderAvailable as exc:
-                    # Includes replies that never parsed. Not cached, so the
-                    # next run gets another go at the article.
+                    # Includes replies that never parsed. Not cached - not
+                    # even the chunks that worked - so the next run gets
+                    # another go at the whole article.
                     failed += 1
                     last_error = str(exc)
                     continue
@@ -185,14 +230,35 @@ def _providers_from_env() -> tuple[str, ...]:
     return names or DEFAULT_PROVIDERS
 
 
-def _prompt(post: dict) -> str:
-    return PROMPT.format(
-        published=(post.get("date") or "")[:10],
-        kinds=", ".join(KINDS),
-        max_events=MAX_EVENTS_PER_ARTICLE,
-        title=_clean(post.get("title", {}).get("rendered", "")),
-        body=article_text(post.get("content", {}).get("rendered", ""))[:MAX_ARTICLE_CHARS],
-    )
+def _prompts(post: dict) -> list[str]:
+    """One prompt per chunk; a short article is a single chunk."""
+    chunks = article_chunks(post.get("content", {}).get("rendered", ""))
+    reference = _reference_date(post)
+    return [
+        PROMPT.format(
+            published=reference.isoformat() if reference else "",
+            part=(f"\n\nThis is part {i} of {len(chunks)} of the article; list "
+                  "only the events in this part." if len(chunks) > 1 else ""),
+            kinds=", ".join(KINDS),
+            max_events=MAX_EVENTS_PER_ARTICLE,
+            title=_clean(post.get("title", {}).get("rendered", "")),
+            body=chunk,
+        )
+        for i, chunk in enumerate(chunks, 1)
+    ]
+
+
+def article_chunks(fragment: str) -> list[str]:
+    """Article text in pieces of at most MAX_ARTICLE_CHARS, split at <h2>s."""
+    sections = [article_text(part) for part in re.split(r"(?=<h2\b)", fragment or "")]
+    chunks: list[str] = []
+    for section in filter(None, sections):
+        section = section[:MAX_ARTICLE_CHARS]
+        if chunks and len(chunks[-1]) + 1 + len(section) <= MAX_ARTICLE_CHARS:
+            chunks[-1] += "\n" + section
+        else:
+            chunks.append(section)
+    return chunks[:MAX_CHUNKS] or [""]
 
 
 def article_text(fragment: str) -> str:
@@ -228,10 +294,11 @@ def to_events(post: dict, items: list[dict], source: str) -> list[Event]:
     """Validated Events from one article's extraction.
 
     The model's output is checked rather than trusted: an entry without a
-    title or a parseable date is dropped, and so is one dated before the
-    article or more than a year after it - a sign it misread the year.
+    title or a parseable date is dropped, and so is one that was over before
+    the article's last update or starts more than a year after it - a sign
+    it misread the year.
     """
-    published = _published(post)
+    published = _reference_date(post)
     link = post.get("link", "")
     images = _images(post)
     excerpt = article_text(post.get("excerpt", {}).get("rendered", ""))
@@ -243,16 +310,22 @@ def to_events(post: dict, items: list[dict], source: str) -> list[Event]:
         if not title or start is None:
             continue
         start_day = start.date()
-        if published and not (published - timedelta(days=2) <= start_day
-                              <= published + timedelta(days=400)):
-            continue
         end = _when(item.get("end"))
         if end is not None and end.replace(tzinfo=None) < start.replace(tzinfo=None):
             end = None
-        source_id = f"{post.get('id')}:{start_day.isoformat()}"
+        # A round-up rewritten weekly still lists an exhibit that opened
+        # months ago: fine while it's running.
+        last_day = end.date() if end is not None else start_day
+        if published and not (last_day >= published - timedelta(days=2)
+                              and start_day <= published + timedelta(days=400)):
+            continue
+        # By title, not position: a round-up reorders its items every week,
+        # and a counter would hand an event a different id each time.
+        slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:40] or "x"
+        source_id = f"{post.get('id')}:{start_day.isoformat()}:{slug}"
         n = 2
         while source_id in seen:
-            source_id = f"{post.get('id')}:{start_day.isoformat()}:{n}"
+            source_id = f"{source_id.rsplit('~', 1)[0]}~{n}"
             n += 1
         seen.add(source_id)
         kind = _clean(item.get("kind")).lower()
@@ -269,6 +342,7 @@ def to_events(post: dict, items: list[dict], source: str) -> list[Event]:
             url=link,
             description=_clean(item.get("summary")) or excerpt[:300],
             images=images,
+            date_approx=item.get("date_from_title") is True,
         ))
     return events
 
@@ -293,11 +367,16 @@ def _when(value) -> datetime | None:
     return parsed
 
 
-def _published(post: dict) -> date | None:
-    try:
-        return datetime.fromisoformat(post.get("date", "")).date()
-    except ValueError:
-        return None
+def _reference_date(post: dict) -> date | None:
+    """When the article was last written: for a rewritten round-up that is
+    the latest update, not the years-old first publication."""
+    days = []
+    for field in ("date", "modified"):
+        try:
+            days.append(datetime.fromisoformat(post.get(field) or "").date())
+        except ValueError:
+            pass
+    return max(days, default=None)
 
 
 def _cost(value) -> str:

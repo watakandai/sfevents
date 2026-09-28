@@ -77,7 +77,7 @@ def test_an_article_becomes_a_structured_event():
     events = fetcher().parse([SUNSET])
     [e] = events
     assert e.source == "secretsf"
-    assert e.source_id == "52503:2026-09-25"
+    assert e.source_id == "52503:2026-09-25:sunset-night-market"
     assert e.title == "Sunset Night Market"
     assert e.start.isoformat() == "2026-09-25T17:00:00-07:00"
     assert e.end.isoformat() == "2026-09-25T22:00:00-07:00"
@@ -105,11 +105,11 @@ def test_an_article_that_is_not_an_event_yields_nothing():
     assert fetcher().parse([GUIDE]) == []
 
 
-def test_the_prompt_carries_the_publish_date_and_clean_article_text():
+def test_the_prompt_carries_the_update_date_and_clean_article_text():
     llm = StubLLM()
     fetcher(llm=llm).parse([SUNSET])
     [prompt] = llm.prompts
-    assert "published 2026-09-21" in prompt
+    assert "last updated 2026-09-21" in prompt
     assert "Sunset Night Market" in prompt
     assert "<p>" not in prompt and "<strong>" not in prompt
     assert "See also" not in prompt
@@ -155,7 +155,50 @@ def test_two_events_on_one_date_get_distinct_ids():
     events = secretsf.to_events(SUNSET, [
         {"title": "A", "start": "2026-09-25"}, {"title": "B", "start": "2026-09-25"},
     ], "secretsf")
-    assert [e.source_id for e in events] == ["52503:2026-09-25", "52503:2026-09-25:2"]
+    assert [e.source_id for e in events] == ["52503:2026-09-25:a", "52503:2026-09-25:b"]
+
+
+def test_ids_survive_a_round_up_reordering_its_items():
+    a, b = {"title": "Aura", "start": "2026-09-25"}, {"title": "Opera", "start": "2026-09-25"}
+    first = {e.title: e.source_id for e in secretsf.to_events(SUNSET, [a, b], "secretsf")}
+    again = {e.title: e.source_id for e in secretsf.to_events(SUNSET, [b, a], "secretsf")}
+    assert first == again
+    assert len(set(first.values())) == 2
+
+
+# ------------------------------- round-ups ------------------------------
+
+# An evergreen post: first published in 2022, rewritten every week.
+ROUNDUP = {**SUNSET, "id": 5623, "date": "2022-03-04T10:48:32",
+           "modified": "2026-09-23T10:12:25",
+           "title": {"rendered": "17 fun things to do this weekend: September 25-27"}}
+
+
+def test_a_rewritten_round_up_is_dated_by_its_last_update():
+    [e] = _one({"title": "Aura", "start": "2026-09-25", "end": "2026-09-27",
+                "date_from_title": True}, post=ROUNDUP)
+    assert e.date_approx
+    llm = StubLLM()
+    fetcher(llm=llm).parse([ROUNDUP])
+    assert "last updated 2026-09-23" in llm.prompts[0]
+
+
+def test_a_running_exhibit_that_opened_before_the_update_is_kept():
+    assert _one({"title": "Old", "start": "2026-06-01"}, post=ROUNDUP) == []
+    assert len(_one({"title": "Exhibit", "start": "2026-06-01", "end": "2026-12-01"},
+                    post=ROUNDUP)) == 1
+
+
+def test_a_long_round_up_is_extracted_a_chunk_at_a_time():
+    section = "<h2>Event {n}</h2><p>" + "words " * 400 + "</p>"
+    html = "<p>Intro.</p>" + "".join(section.format(n=n) for n in range(6))
+    chunks = secretsf.article_chunks(html)
+    assert len(chunks) == 3 and all(len(c) <= secretsf.MAX_ARTICLE_CHARS for c in chunks)
+    # Headings never land apart from their text.
+    assert all(c.startswith(("Intro.", "Event")) for c in chunks)
+    llm = StubLLM()
+    fetcher(llm=llm).parse([{**ROUNDUP, "content": {"rendered": html}}])
+    assert len(llm.prompts) == 3 and "part 2 of 3" in llm.prompts[1]
 
 
 def test_parse_reply_tolerates_code_fences_and_rejects_non_json():
@@ -233,10 +276,28 @@ def test_fetch_asks_for_recent_non_sponsored_things_to_do(monkeypatch):
     events = SecretSFFetcher(llm=StubLLM()).fetch()
 
     assert len(events) == 1
-    assert "categories=13" in seen["url"]
+    assert "categories=13%2C2967%2C3" in seen["url"]
     assert "categories_exclude=12" in seen["url"]
     assert "after=" in seen["url"]
     assert "wp%3Afeaturedmedia" in seen["url"]
+
+
+def test_fetch_follows_every_page(monkeypatch):
+    urls = []
+
+    class Page(io.BytesIO):
+        headers = {"X-WP-TotalPages": "2"}
+
+    def fake_urlopen(req, timeout=None):
+        urls.append(req.full_url)
+        post = SUNSET if len(urls) == 1 else SUNDOWN
+        return Page(json.dumps([post]).encode())
+
+    monkeypatch.setattr(secretsf.urllib.request, "urlopen", fake_urlopen)
+    events = SecretSFFetcher(llm=StubLLM()).fetch()
+
+    assert ["page=1" in urls[0], "page=2" in urls[1], len(urls)] == [True, True, 2]
+    assert {e.title for e in events} >= {"Sunset Night Market", "Sundown Cinema: School of Rock"}
 
 
 # ----------------------------- FallbackLLM ------------------------------
@@ -333,9 +394,9 @@ def test_an_articles_old_events_are_replaced_not_left_as_duplicates(tmp_path):
     removed = prune_article_events(f.db_path, "secretsf", f.covered_articles,
                                    [e.source_id for e in new])
 
-    assert removed == 2  # 52503:2026-10-08 and :10-09 -> only :09-25 now
+    assert removed == 2  # the two Show dates -> only the market now
     ids = sorted(r["source_id"] for r in query_events(f.db_path))
-    assert ids == ["1:2026-09-25", "52503:2026-09-25"]
+    assert ids == ["1:2026-09-25:b", "52503:2026-09-25:sunset-night-market"]
 
 
 def test_an_article_that_failed_to_extract_keeps_its_rows(tmp_path):
