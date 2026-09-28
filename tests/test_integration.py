@@ -523,3 +523,50 @@ def test_export_flags_events_new_in_the_latest_fetch(tmp_path):
     assert meta["ranked_by"] == ["ollama:qwen3.5:4b"]
     assert meta["new_count"] == 1
     assert meta["updated_at"]
+
+
+def test_export_holds_each_source_group_to_its_weekly_quota(tmp_path, monkeypatch):
+    import json
+    from datetime import datetime
+
+    from sfevents.db import set_scores
+    from sfevents.fetchers.tribe import TribeEventsFetcher
+    from sfevents.models import Event
+
+    monkeypatch.setattr(cli_module, "FETCHERS", [
+        TribeEventsFetcher("santacruz_org", "https://x.test", weekends_only=True),
+    ])
+    monkeypatch.setattr(cli_module, "SOURCE_GROUPS", {
+        "Day trips": (("santacruz_org",), 2), "SF listings": (("funcheap_sf",), None),
+    })
+    db_path = tmp_path / "events.db"
+    out_path = tmp_path / "events.json"
+    init_db(db_path)
+    sat, sun, wed = datetime(2099, 10, 24, 11), datetime(2099, 10, 25, 11), datetime(2099, 10, 21, 18)
+    upsert_events(db_path, [
+        Event("santacruz_org", "1", "Low", sat, sat), Event("santacruz_org", "2", "High", sun, sun),
+        Event("santacruz_org", "3", "Mid", sat, sat), Event("santacruz_org", "4", "Weeknight", wed, wed),
+        Event("funcheap_sf", "5", "SF thing", wed, wed),
+    ])
+    ids = {r["title"]: r["id"] for r in query_events(db_path)}
+    set_scores(db_path, {ids["Low"]: (40, ""), ids["High"]: (90, ""), ids["Mid"]: (60, ""),
+                         ids["Weeknight"]: (99, "")}, "stub:model", "h")
+
+    output = run_cli(["--db", str(db_path), "export", "--out", str(out_path)])
+
+    titles = {e["title"] for e in json.loads(out_path.read_text())}
+    assert titles == {"High", "Mid", "SF thing"}
+    assert "2 over their group's quota" in output
+
+
+def test_sources_in_one_group_share_its_quota(monkeypatch):
+    monkeypatch.setattr(cli_module, "FETCHERS", [])
+    monkeypatch.setattr(cli_module, "SOURCE_GROUPS", {"SF": (("funcheap_sf", "dothebay"), 2)})
+    events = [
+        {"source": "funcheap_sf", "title": "a", "start_ts": "2099-10-20T10:00:00", "score": 50},
+        {"source": "dothebay", "title": "b", "start_ts": "2099-10-21T10:00:00", "score": 90},
+        {"source": "dothebay", "title": "c", "start_ts": "2099-10-22T10:00:00", "score": 70},
+        {"source": "dothebay", "title": "d", "start_ts": "2099-10-27T10:00:00", "score": 10},  # next week
+        {"source": "dothebay", "title": "e", "start_ts": None, "score": 0},  # undated: never capped
+    ]
+    assert [e["title"] for e in cli_module._apply_quotas(events)] == ["b", "c", "d", "e"]

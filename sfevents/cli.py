@@ -21,7 +21,7 @@ from .fetchers.nineteenhz import NineteenHzFetcher
 from .fetchers.seasonal import SeasonalFetcher
 from .fetchers.secretsf import SecretSFFetcher
 from .fetchers.sfrecpark import SFRecParkFetcher
-from .fetchers.tribe import TribeEventsFetcher
+from .fetchers.tribe import TribeEventsFetcher, touches_weekend
 
 DEFAULT_DB = Path.home() / ".sfevents" / "events.db"
 FETCHERS = [
@@ -36,10 +36,24 @@ FETCHERS = [
     # Day trips: visitor-bureau calendars that all run the same WordPress
     # events plugin. South Lake Tahoe (tahoesouth.com) works too, but it's
     # ~800 listings, mostly bar nights, 3.5h+ away.
-    TribeEventsFetcher("santacruz_org", "https://www.santacruz.org"),
-    TribeEventsFetcher("visit_sausalito", "https://www.visitsausalito.org"),
-    TribeEventsFetcher("bodega_bay", "https://www.bodegabay.com"),
+    # Weekends only: Santa Cruz alone lists ~450 events in 60 days, mostly
+    # weeknight local things.
+    TribeEventsFetcher("santacruz_org", "https://www.santacruz.org", weekends_only=True),
+    TribeEventsFetcher("visit_sausalito", "https://www.visitsausalito.org", weekends_only=True),
+    TribeEventsFetcher("bodega_bay", "https://www.bodegabay.com", weekends_only=True),
 ]
+
+# Quotas, so no one kind of source floods the calendar: at most this many
+# events per group per week (Monday-Sunday, by start date), best-scored
+# first. None means uncapped. Sources in no group are uncapped too.
+SOURCE_GROUPS = {
+    "SF listings": (("funcheap_sf", "dothebay", "sfrecpark"), 100),
+    "Nightlife & music": (("19hz_bayarea",), 15),
+    "Editorial": (("secretsf",), None),
+    "Curated": (("annual_bay_area", "seasonal_bay_area"), None),
+    # Weekend events only (above), so this is per weekend.
+    "Day trips": (("santacruz_org", "visit_sausalito", "bodega_bay"), 5),
+}
 
 # Sources known to be fragile (HTML scraping rather than RSS/API/local data) -
 # a silent drop to zero here is the main failure mode worth watching for.
@@ -236,6 +250,36 @@ def _export_meta(events: list[dict]) -> dict:
     }
 
 
+def _apply_quotas(events: list[dict]) -> list[dict]:
+    """Drop weeknight day-trip events, then hold each group to its quota.
+
+    Weeknights are dropped here as well as at fetch time so rows cached
+    before the rule existed go too. The quota goes by score, which fetch
+    hasn't got. Undated events are never capped.
+    """
+    weekends_only = {f.name for f in FETCHERS if getattr(f, "weekends_only", False)}
+    group_of = {src: (name, quota) for name, (sources, quota) in SOURCE_GROUPS.items()
+                for src in sources}
+    taken: dict[tuple, int] = {}
+    dropped: set[int] = set()
+    for e in sorted(events, key=lambda e: -(e.get("score") or 0)):
+        if not e.get("start_ts"):
+            continue
+        start = datetime.fromisoformat(e["start_ts"])
+        end = datetime.fromisoformat(e["end_ts"]) if e.get("end_ts") else None
+        if e["source"] in weekends_only and not touches_weekend(start, end):
+            dropped.add(id(e))
+            continue
+        group, quota = group_of.get(e["source"], (None, None))
+        if quota is None:
+            continue
+        week = (group, *start.isocalendar()[:2])
+        taken[week] = taken.get(week, 0) + 1
+        if taken[week] > quota:
+            dropped.add(id(e))
+    return [e for e in events if id(e) not in dropped]
+
+
 def _cmd_export(args) -> None:
     today = date.today().isoformat()
     events = [_keyed(row_to_dict(row)) for row in query_events(args.db, order_by=args.sort)]
@@ -258,6 +302,9 @@ def _cmd_export(args) -> None:
     merged = len(events)
     events = dedupe(events)
     merged -= len(events)
+    over_quota = len(events)
+    events = _apply_quotas(events)
+    over_quota -= len(events)
     meta = _export_meta(events)
     if not args.full:
         events = [_slim(e) for e in events]
@@ -274,12 +321,14 @@ def _cmd_export(args) -> None:
     # Beside events.json rather than inside it, so the events file stays a
     # plain array and its diff isn't touched by a timestamp that always moves.
     (out_path.parent / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
-    dropped = total - len(events) - merged
+    dropped = total - len(events) - merged - over_quota
     notes = []
     if dropped:
         notes.append(f"{dropped} past events dropped")
     if merged:
         notes.append(f"{merged} duplicates merged")
+    if over_quota:
+        notes.append(f"{over_quota} over their group's quota")
     note = f" ({', '.join(notes)})" if notes else ""
     print(f"exported {len(events)} events to {out_path}{note}")
 

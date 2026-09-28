@@ -63,3 +63,14 @@ def test_hidden_and_unpublished_listings_are_skipped():
         item(3, "Real", "2026-10-01 10:00:00"),
     ])
     assert [e.title for e in events] == ["Real"]
+
+
+def test_a_day_trip_calendar_keeps_only_weekend_events():
+    f = TribeEventsFetcher("santacruz_org", "https://example.test", weekends_only=True)
+    events = f.parse([
+        item(1, "Wednesday Sailboat Races", "2026-09-30 18:00:00"),
+        item(2, "Chili Cook-Off", "2026-10-24 11:00:00"),  # Saturday
+        item(3, "Plein Air Festival", "2026-10-30 09:00:00", "2026-11-02 17:00:00"),  # Fri-Mon
+        item(4, "Exhibit", "2026-10-05 10:00:00", "2026-10-09 17:00:00"),  # Mon-Fri
+    ])
+    assert [e.title for e in events] == ["Chili Cook-Off", "Plein Air Festival"]

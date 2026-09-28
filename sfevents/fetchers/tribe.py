@@ -31,15 +31,22 @@ class TribeEventsFetcher:
     is kept, with the rest summarized in its description, so a daily tour
     doesn't bury every other event (and cost 100 LLM scores). Next week's
     fetch picks up the following date.
+
+    A day-trip calendar also lists every weeknight contra dance and sailboat
+    race in its town - hundreds of listings that would outnumber SF's own.
+    `weekends_only` keeps what could make a day trip (profile.md: weeknights
+    are for SF); the export's quota (cli.SOURCE_GROUPS) then keeps the best
+    few per weekend.
     """
 
     def __init__(self, name: str, site: str, days: int = 60, timeout: int = 30,
-                 today: date | None = None):
+                 today: date | None = None, weekends_only: bool = False):
         self.name = name
         self.site = site.rstrip("/")
         self.days = days
         self.timeout = timeout
         self._today = today  # injectable for tests
+        self.weekends_only = weekends_only
 
     def fetch(self) -> list[Event]:
         today = self._today or date.today()
@@ -65,6 +72,8 @@ class TribeEventsFetcher:
 
     def parse(self, items: list[dict]) -> list[Event]:
         events = [e for e in (self._event(item) for item in items) if e]
+        if self.weekends_only:
+            events = [e for e in events if touches_weekend(e.start, e.end)]
         return collapse_repeats(events)
 
     def _event(self, item: dict) -> Event | None:
@@ -94,6 +103,20 @@ class TribeEventsFetcher:
             description=_text(item.get("description"))[:600],
             images=[image["url"]] if image.get("url") else [],
         )
+
+
+def touches_weekend(start: datetime | None, end: datetime | None) -> bool:
+    """Whether an event is on, or runs through, a Saturday or Sunday.
+
+    Undated counts as yes: there's no telling it isn't.
+    """
+    if start is None:
+        return True
+    first = start.date()
+    last = max(end.date(), first) if end is not None else first
+    return (last - first).days >= 6 or any(
+        (first + timedelta(days=i)).weekday() >= 5 for i in range((last - first).days + 1)
+    )
 
 
 def collapse_repeats(events: list[Event]) -> list[Event]:
