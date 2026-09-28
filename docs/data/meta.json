@@ -1,8 +1,8 @@
 {
-  "updated_at": "2026-09-28T04:07:20+00:00",
+  "updated_at": "2026-09-28T04:32:29+00:00",
   "ranked_by": [
     "ollama:qwen3.5:4b",
     "groq:openai/gpt-oss-120b"
   ],
-  "new_count": 393
+  "new_count": 275
 }
