@@ -1,8 +1,8 @@
 {
-  "updated_at": "2026-11-02T19:29:37+00:00",
+  "updated_at": "2026-11-05T21:06:31+00:00",
   "ranked_by": [
-    "gemini:gemini-3.6-flash",
-    "groq:openai/gpt-oss-120b"
+    "groq:openai/gpt-oss-120b",
+    "gemini:gemini-3.6-flash"
   ],
-  "new_count": 128
+  "new_count": 120
 }
